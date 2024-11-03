@@ -1,0 +1,143 @@
+# Load necessary libraries
+library(readxl)
+library(dplyr)
+library(openxlsx)
+library(tibble)  # Load tibble package for column_to_rownames function
+
+# Step 1: Load data files interactively
+cat("Please select the 'Household income quintile.xlsx' file.")
+income_quintile_data <- read_excel(file.choose())  # Load "Household income quintile.xlsx"
+
+cat("Please select the 'adjusted_coicop_expenditures_by_region.xlsx' file.")
+coicop_expenditures_data <- read_excel(file.choose())  # Load "adjusted_coicop_expenditures_by_region.xlsx"
+
+cat("Please select the 'APC.xlsx' file.")
+apc_data <- read_excel(file.choose())  # Load "APC.xlsx"
+
+cat("Please select the 'carcom10.xlsx' file.")
+carcom10_data <- read_excel(file.choose())  # Load "carcom10.xlsx"
+
+# Step 2: Calculate gender-based proportions from primary income earners in carcom10.xlsx
+# Filter for primary income earners
+income_earners <- carcom10_data %>% filter(perc == 1)
+
+# Calculate gender proportions for primary income earners
+male_primary_earner_proportion <- income_earners %>% filter(sex == 1) %>% nrow() / nrow(income_earners)
+female_primary_earner_proportion <- income_earners %>% filter(sex == 2) %>% nrow() / nrow(income_earners)
+
+cat("Male proportion:", male_primary_earner_proportion, "\n")
+cat("Female proportion:", female_primary_earner_proportion, "\n")
+
+# Step 3: Prepare APC matrix with controlled variation and scaling up by 10
+set.seed(123)  # Set seed for reproducibility
+
+regions <- c("NW", "NE", "Toscana", "Centro", "Sud", "Ext")
+coicop_categories <- 1:45
+apc_matrix <- as.data.frame(matrix(NA, nrow = length(coicop_categories), ncol = length(regions)))
+colnames(apc_matrix) <- regions
+rownames(apc_matrix) <- coicop_categories
+
+# Apply controlled variability based on APC average values in apc.xlsx
+for (region in regions) {
+  # Get the average APC value for the region
+  avg_apc_value <- apc_data %>% filter(macro_region == region) %>% pull(APC)
+  
+  # Generate values between 0.7 and 0.9 with average around the APC average value, then scale by 10
+  for (i in 1:length(coicop_categories)) {
+    # Apply a small random variation around the avg_apc_value, clipped between 0.7 and 0.9
+    variability <- runif(1, -0.1, 0.1)  # Random variability between -0.1 and +0.1
+    apc_value <- avg_apc_value + variability
+    
+    # Clip values to ensure they stay within the 0.7 to 0.9 range, then scale by 10
+    apc_matrix[i, region] <- min(max(apc_value, 0.7), 0.9) * 10
+  }
+}
+
+# Step 4: Convert quintile percentages to shares
+income_quintile_shares <- income_quintile_data %>%
+    mutate(across(-`Fifth of equivalent household income`, ~ ./sum(.))) %>%
+    column_to_rownames("Fifth of equivalent household income") %>%
+    as.data.frame()
+
+# Step 5: Apply the income quintile shares to each COICOP category separately
+# using the original proportions in each column from coicop_expenditures_data
+coicop_quintile_vectors <- list()
+apc_quintile_vectors <- list()
+
+for (quintile in colnames(income_quintile_shares)) {
+  coicop_quintile_vectors[[quintile]] <- as.data.frame(matrix(NA, nrow = 45, ncol = length(regions)))
+  colnames(coicop_quintile_vectors[[quintile]]) <- regions
+  rownames(coicop_quintile_vectors[[quintile]]) <- 1:45  # Assuming these represent COICOP categories
+  
+  # Use the varied APC matrix for each quintile and gender
+  apc_quintile_vectors[[quintile]] <- apc_matrix
+  
+  # For each region, apply the income quintile share and the distinct values for each COICOP category
+  for (region in regions) {
+    share <- income_quintile_shares[region, quintile]
+    coicop_quintile_vectors[[quintile]][[region]] <- coicop_expenditures_data[[region]] * share
+    apc_quintile_vectors[[quintile]][[region]] <- apc_matrix[[region]] * share
+  }
+}
+
+# Step 6: Apply gender distribution to each quintile matrix and normalize combined sums to match original
+output_file <- "APC_and_COICOP_Quintile_Vectors_Refined_Gender_Distribution_with_Cumulative_Normalization.xlsx"
+wb <- createWorkbook()
+
+# Calculate original column sums for reference
+original_column_sums <- colSums(coicop_expenditures_data)
+
+# Initialize a variable to store cumulative sums of all COICOP sheets for later normalization
+cumulative_coicop_sums <- as.data.frame(matrix(0, nrow = 45, ncol = length(regions)))
+colnames(cumulative_coicop_sums) <- regions
+
+# Add COICOP quintile vectors with gender breakdown
+for (quintile in names(coicop_quintile_vectors)) {
+  # Adjust each vector for gender proportions
+  male_vector <- coicop_quintile_vectors[[quintile]] * male_primary_earner_proportion
+  female_vector <- coicop_quintile_vectors[[quintile]] * female_primary_earner_proportion
+  
+  # Accumulate sums across all gender and quintile sheets
+  cumulative_coicop_sums <- cumulative_coicop_sums + male_vector + female_vector
+}
+
+# Calculate scaling factors to normalize the combined cumulative sums to match the original column sums
+scaling_factors <- original_column_sums / colSums(cumulative_coicop_sums)
+
+# Reapply normalization to each individual sheet (male and female) using the scaling factors
+for (quintile in names(coicop_quintile_vectors)) {
+  male_vector <- coicop_quintile_vectors[[quintile]] * male_primary_earner_proportion
+  female_vector <- coicop_quintile_vectors[[quintile]] * female_primary_earner_proportion
+  
+  # Apply the normalization scaling factor to each region in male and female vectors
+  for (region in regions) {
+    male_vector[[region]] <- male_vector[[region]] * scaling_factors[region]
+    female_vector[[region]] <- female_vector[[region]] * scaling_factors[region]
+  }
+  
+  # Write normalized male and female vectors to Excel
+  addWorksheet(wb, paste0("COICOP_", quintile, "_Male"))
+  writeData(wb, sheet = paste0("COICOP_", quintile, "_Male"), male_vector)
+  
+  addWorksheet(wb, paste0("COICOP_", quintile, "_Female"))
+  writeData(wb, sheet = paste0("COICOP_", quintile, "_Female"), female_vector)
+}
+
+# Add APC quintile vectors with gender breakdown (with controlled variation)
+for (quintile in names(apc_quintile_vectors)) {
+  # Adjust each vector for gender proportions
+  male_vector <- apc_quintile_vectors[[quintile]] * male_primary_earner_proportion
+  female_vector <- apc_quintile_vectors[[quintile]] * female_primary_earner_proportion
+  
+  # Write to Excel
+  addWorksheet(wb, paste0("APC_", quintile, "_Male"))
+  writeData(wb, sheet = paste0("APC_", quintile, "_Male"), male_vector)
+  
+  addWorksheet(wb, paste0("APC_", quintile, "_Female"))
+  writeData(wb, sheet = paste0("APC_", quintile, "_Female"), female_vector)
+}
+
+# Save the workbook
+saveWorkbook(wb, output_file, overwrite = TRUE)
+cat("The Excel file 'APC_and_COICOP_Quintile_Vectors_Refined_Gender_Distribution_with_Cumulative_Normalization.xlsx' has been saved successfully.")
+
